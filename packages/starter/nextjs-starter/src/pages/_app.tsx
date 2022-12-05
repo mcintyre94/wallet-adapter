@@ -1,7 +1,7 @@
 import { WalletAdapterNetwork } from '@solana/wallet-adapter-base';
 import { ConnectionProvider, WalletProvider } from '@solana/wallet-adapter-react';
 import { WalletModalProvider } from '@solana/wallet-adapter-react-ui';
-import { UnsafeBurnerWalletAdapter } from '@solana/wallet-adapter-wallets';
+import { PhantomWalletAdapter, UnsafeBurnerWalletAdapter } from '@solana/wallet-adapter-wallets';
 import { clusterApiUrl } from '@solana/web3.js';
 import type { AppProps } from 'next/app';
 import type { FC } from 'react';
@@ -33,6 +33,7 @@ const App: FC<AppProps> = ({ Component, pageProps }) => {
              * in the npm package `@solana/wallet-adapter-wallets`.
              */
             new UnsafeBurnerWalletAdapter(),
+            new PhantomWalletAdapter(),
         ],
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [network]
@@ -40,7 +41,7 @@ const App: FC<AppProps> = ({ Component, pageProps }) => {
 
     return (
         <ConnectionProvider endpoint={endpoint}>
-            <WalletProvider wallets={wallets} autoConnect>
+            <WalletProvider wallets={wallets} /* autoconnect disabled for now */>
                 <WalletModalProvider>
                     <Component {...pageProps} />
                 </WalletModalProvider>

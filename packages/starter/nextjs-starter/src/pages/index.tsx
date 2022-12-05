@@ -1,3 +1,5 @@
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import { Transaction, SystemProgram, PublicKey, Keypair, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import type { NextPage } from 'next';
 import dynamic from 'next/dynamic';
 import Head from 'next/head';
@@ -15,6 +17,29 @@ const WalletMultiButtonDynamic = dynamic(
 );
 
 const Home: NextPage = () => {
+    const { connection } = useConnection();
+    const { publicKey, sendTransaction } = useWallet();
+
+    async function createAndSendTransaction() {
+        if (!publicKey) return;
+
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+
+        const transaction = new Transaction({
+            blockhash,
+            lastValidBlockHeight,
+            feePayer: publicKey,
+        }).add(
+            SystemProgram.transfer({
+                fromPubkey: publicKey,
+                toPubkey: Keypair.generate().publicKey,
+                lamports: LAMPORTS_PER_SOL / 1000,
+            })
+        );
+
+        await sendTransaction(transaction, connection);
+    }
+
     return (
         <div className={styles.container}>
             <Head>
@@ -31,7 +56,14 @@ const Home: NextPage = () => {
                 <div className={styles.walletButtons}>
                     <WalletMultiButtonDynamic />
                     <WalletDisconnectButtonDynamic />
+                    <button disabled={!publicKey} onClick={createAndSendTransaction}>
+                        Send TX
+                    </button>
                 </div>
+
+                <p className={styles.description}>
+                    {publicKey ? <span>Connected wallet: {publicKey.toBase58()}</span> : <span>No wallet yet</span>}
+                </p>
 
                 <p className={styles.description}>
                     Get started by editing <code className={styles.code}>pages/index.tsx</code>

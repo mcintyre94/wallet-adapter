@@ -25,6 +25,8 @@ import type {
     VersionedTransaction,
 } from '@solana/web3.js';
 import { PublicKey } from '@solana/web3.js';
+import nacl from 'tweetnacl';
+import bs58 from 'bs58';
 
 interface PhantomWalletEvents {
     connect(...args: unknown[]): unknown;
@@ -75,6 +77,11 @@ export class PhantomWalletAdapter extends BaseMessageSignerWalletAdapter {
             ? WalletReadyState.Unsupported
             : WalletReadyState.NotDetected;
 
+    private _deepLinkPublicKeyStorage = 'PHANTOM_DEEP_LINK_PUBLIC_KEY';
+    private _deepLinkSecretKeyStorage = 'PHANTOM_DEEP_LINK_SECRET_KEY';
+    private _deepLinkSharedSecretStorage = 'PHANTOM_DEEP_LINK_SHARED_SECRET';
+    private _deepLinkSessionStorage = 'PHANTOM_DEEP_LINK_SESSION';
+
     constructor(config: PhantomWalletAdapterConfig = {}) {
         super();
         this._connecting = false;
@@ -82,14 +89,21 @@ export class PhantomWalletAdapter extends BaseMessageSignerWalletAdapter {
         this._publicKey = null;
 
         if (this._readyState !== WalletReadyState.Unsupported) {
-            scopePollingDetectionStrategy(() => {
-                if (window.phantom?.solana?.isPhantom || window.solana?.isPhantom) {
-                    this._readyState = WalletReadyState.Installed;
-                    this.emit('readyStateChange', this._readyState);
-                    return true;
-                }
-                return false;
-            });
+            // TODO: only do this on iOS + not webview
+            const useDeepLink = true;
+            if (useDeepLink) {
+                this._readyState = WalletReadyState.Loadable;
+                this.emit('readyStateChange', this._readyState);
+            } else {
+                scopePollingDetectionStrategy(() => {
+                    if (window.phantom?.solana?.isPhantom || window.solana?.isPhantom) {
+                        this._readyState = WalletReadyState.Installed;
+                        this.emit('readyStateChange', this._readyState);
+                        return true;
+                    }
+                    return false;
+                });
+            }
         }
     }
 
@@ -109,40 +123,136 @@ export class PhantomWalletAdapter extends BaseMessageSignerWalletAdapter {
         return this._readyState;
     }
 
+    private localStorageSet(key: string, value: string) {
+        localStorage.setItem(key, value.toString());
+    }
+
+    private localStorageGetUint8(key: string): Uint8Array {
+        const valueString = localStorage.getItem(key);
+        if (!valueString) {
+            // error
+            const error = new WalletError(`Key ${key} not stored`);
+            this.emit('error', error);
+            throw error;
+        }
+
+        return Uint8Array.from(valueString.split(',').map(Number));
+    }
+
+    private makeRedirectUrl() {
+        const url = new URL(window.location.href);
+        // Strip Phantom query params
+        url.searchParams.delete('phantom_encryption_public_key');
+        url.searchParams.delete('nonce');
+        url.searchParams.delete('data');
+        url.searchParams.delete('errorCode');
+        url.searchParams.delete('errorMessage');
+        return url.toString();
+    }
+
+    private makeDeepLinkUrl(path: string, params: URLSearchParams) {
+        return `https://phantom.app/ul/v1/${path}?${params.toString()}`;
+    }
+
+    private async connectUsingDeepLink(): Promise<void> {
+        const dappDeepLinkKeypair = nacl.box.keyPair();
+
+        this.localStorageSet(this._deepLinkPublicKeyStorage, dappDeepLinkKeypair.publicKey.toString());
+        this.localStorageSet(this._deepLinkSecretKeyStorage, dappDeepLinkKeypair.secretKey.toString());
+
+        const appUrl = this.makeRedirectUrl();
+        const connectUrl = this.makeDeepLinkUrl(
+            'connect',
+            new URLSearchParams({
+                app_url: appUrl,
+                dapp_encryption_public_key: bs58.encode(dappDeepLinkKeypair.publicKey),
+                redirect_link: appUrl,
+                cluster: 'devnet', // TODO: pass this in
+            })
+        );
+
+        alert(connectUrl);
+
+        window.location.href = connectUrl;
+    }
+
+    private handleConnectionDeepLinkParams(phantomEncryptionPublicKey: string, nonce: string, encryptedData: string) {
+        const dappSecretKey = this.localStorageGetUint8(this._deepLinkSecretKeyStorage);
+        const phantomPublicKey = bs58.decode(phantomEncryptionPublicKey);
+
+        const sharedSecret = nacl.box.before(phantomPublicKey, dappSecretKey);
+        this.localStorageSet(this._deepLinkSharedSecretStorage, sharedSecret.toString());
+
+        const decrypytedConnectData = nacl.box.open.after(bs58.decode(encryptedData), bs58.decode(nonce), sharedSecret);
+
+        if (!decrypytedConnectData) {
+            const error = new WalletConnectionError('Unable to decrypt connection params');
+            this.emit('error', error);
+            throw error;
+        }
+
+        const parsedConnectData = JSON.parse(Buffer.from(decrypytedConnectData).toString('utf8'));
+
+        const walletPublicKey: string = parsedConnectData.public_key;
+        const session: string = parsedConnectData.session;
+
+        localStorage.setItem(this._deepLinkSessionStorage, session);
+
+        this._publicKey = new PublicKey(walletPublicKey);
+        this.emit('connect', this._publicKey);
+    }
+
     async connect(): Promise<void> {
         try {
-            if (this.connected || this.connecting) return;
-            if (this._readyState !== WalletReadyState.Installed) throw new WalletNotReadyError();
+            if (this.connected || this.connecting || !window) return;
+            if (this._readyState !== WalletReadyState.Installed && this._readyState !== WalletReadyState.Loadable)
+                throw new WalletNotReadyError();
 
             this._connecting = true;
 
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-            const wallet = window.phantom?.solana || window.solana!;
+            if (this._readyState === WalletReadyState.Loadable) {
+                // Check the URL for Phantom deeplink params
+                const urlParams = new URLSearchParams(window.location.search);
+                const phantomEncryptionPublicKey = urlParams.get('phantom_encryption_public_key');
+                const nonce = urlParams.get('nonce');
+                const data = urlParams.get('data');
 
-            if (!wallet.isConnected) {
-                try {
-                    await wallet.connect();
-                } catch (error: any) {
-                    throw new WalletConnectionError(error?.message, error);
+                console.log({ phantomEncryptionPublicKey, nonce, data });
+
+                if (phantomEncryptionPublicKey && nonce && data) {
+                    this.handleConnectionDeepLinkParams(phantomEncryptionPublicKey, nonce, data);
+                } else {
+                    this.connectUsingDeepLink();
                 }
+            } else {
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                const wallet = window.phantom?.solana || window.solana!;
+
+                if (!wallet.isConnected) {
+                    try {
+                        await wallet.connect();
+                    } catch (error: any) {
+                        throw new WalletConnectionError(error?.message, error);
+                    }
+                }
+
+                if (!wallet.publicKey) throw new WalletAccountError();
+
+                let publicKey: PublicKey;
+                try {
+                    publicKey = new PublicKey(wallet.publicKey.toBytes());
+                } catch (error: any) {
+                    throw new WalletPublicKeyError(error?.message, error);
+                }
+
+                wallet.on('disconnect', this._disconnected);
+                wallet.on('accountChanged', this._accountChanged);
+
+                this._wallet = wallet;
+                this._publicKey = publicKey;
+
+                this.emit('connect', publicKey);
             }
-
-            if (!wallet.publicKey) throw new WalletAccountError();
-
-            let publicKey: PublicKey;
-            try {
-                publicKey = new PublicKey(wallet.publicKey.toBytes());
-            } catch (error: any) {
-                throw new WalletPublicKeyError(error?.message, error);
-            }
-
-            wallet.on('disconnect', this._disconnected);
-            wallet.on('accountChanged', this._accountChanged);
-
-            this._wallet = wallet;
-            this._publicKey = publicKey;
-
-            this.emit('connect', publicKey);
         } catch (error: any) {
             this.emit('error', error);
             throw error;
@@ -170,32 +280,97 @@ export class PhantomWalletAdapter extends BaseMessageSignerWalletAdapter {
         this.emit('disconnect');
     }
 
+    private async signAndPrepareTransaction<T extends Transaction | VersionedTransaction>(
+        transaction: T,
+        connection: Connection,
+        options: SendTransactionOptions = {}
+    ): Promise<{ transaction: T; sendOptions: SendTransactionOptions }> {
+        try {
+            const { signers, ...sendOptions } = options;
+
+            if (isVersionedTransaction(transaction)) {
+                signers?.length && transaction.sign(signers);
+            } else {
+                transaction = (await this.prepareTransaction(transaction, connection, sendOptions)) as T;
+                signers?.length && (transaction as Transaction).partialSign(...signers);
+            }
+
+            return { transaction, sendOptions };
+        } catch (error: any) {
+            if (error instanceof WalletError) throw error;
+            throw new WalletSendTransactionError(error?.message, error);
+        }
+    }
+
+    private async sendTransactionUsingDeepLink<T extends Transaction | VersionedTransaction>(
+        transaction: T,
+        connection: Connection,
+        options: SendTransactionOptions = {}
+    ) {
+        const { transaction: preparedTransaction, sendOptions } = await this.signAndPrepareTransaction(
+            transaction,
+            connection,
+            options
+        );
+
+        const dappPublicKey = this.localStorageGetUint8(this._deepLinkPublicKeyStorage);
+        const sharedSecret = this.localStorageGetUint8(this._deepLinkSharedSecretStorage);
+        const session = localStorage.getItem(this._deepLinkSessionStorage);
+
+        const nonce = nacl.randomBytes(24);
+
+        const serializedTransaction = preparedTransaction.serialize({
+            requireAllSignatures: false,
+        });
+
+        const payload = {
+            transaction: bs58.encode(serializedTransaction),
+            sendOptions,
+            session,
+        };
+
+        const encryptedPayload = nacl.box.after(Buffer.from(JSON.stringify(payload)), nonce, sharedSecret);
+
+        const sendTransactionUrl = this.makeDeepLinkUrl(
+            'signAndSendTransaction',
+            new URLSearchParams({
+                dapp_encryption_public_key: bs58.encode(dappPublicKey),
+                nonce: bs58.encode(nonce),
+                redirect_link: this.makeRedirectUrl(),
+                payload: bs58.encode(encryptedPayload),
+            })
+        );
+
+        window.location.href = sendTransactionUrl;
+        return 'TransactionSignature';
+    }
+
     async sendTransaction<T extends Transaction | VersionedTransaction>(
         transaction: T,
         connection: Connection,
         options: SendTransactionOptions = {}
     ): Promise<TransactionSignature> {
         try {
-            const wallet = this._wallet;
-            if (!wallet) throw new WalletNotConnectedError();
+            if (this.readyState === WalletReadyState.Loadable) {
+                return this.sendTransactionUsingDeepLink(transaction, connection, options);
+            } else {
+                const wallet = this._wallet;
+                if (!wallet) throw new WalletNotConnectedError();
 
-            try {
-                const { signers, ...sendOptions } = options;
+                try {
+                    const { transaction: preparedTransaction, sendOptions } = await this.signAndPrepareTransaction(
+                        transaction,
+                        connection,
+                        options
+                    );
+                    sendOptions.preflightCommitment = sendOptions.preflightCommitment || connection.commitment;
 
-                if (isVersionedTransaction(transaction)) {
-                    signers?.length && transaction.sign(signers);
-                } else {
-                    transaction = (await this.prepareTransaction(transaction, connection, sendOptions)) as T;
-                    signers?.length && (transaction as Transaction).partialSign(...signers);
+                    const { signature } = await wallet.signAndSendTransaction(preparedTransaction, sendOptions);
+                    return signature;
+                } catch (error: any) {
+                    if (error instanceof WalletError) throw error;
+                    throw new WalletSendTransactionError(error?.message, error);
                 }
-
-                sendOptions.preflightCommitment = sendOptions.preflightCommitment || connection.commitment;
-
-                const { signature } = await wallet.signAndSendTransaction(transaction, sendOptions);
-                return signature;
-            } catch (error: any) {
-                if (error instanceof WalletError) throw error;
-                throw new WalletSendTransactionError(error?.message, error);
             }
         } catch (error: any) {
             this.emit('error', error);
