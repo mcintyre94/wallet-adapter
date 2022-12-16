@@ -193,3 +193,7 @@ export function isIosAndRedirectable() {
 
     return isIos && isSafari;
 }
+
+export function test() {
+    return true;
+}
