@@ -200,7 +200,7 @@ export const WalletModal: FC<WalletModalProps> = ({ className = '', container = 
                         ) : (
                             <>
                                 <h1 className="wallet-adapter-modal-title">
-                                    You'll need a wallet on Solana to continue
+                                    You'll need a wallet on Solana to continue!!!!!
                                 </h1>
                                 <div className="wallet-adapter-modal-middle">
                                     <WalletSVG />
